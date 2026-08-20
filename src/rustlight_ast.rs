@@ -97,6 +97,7 @@ pub struct ConstDef {
 pub struct TypeAlias {
     pub name: String,
     pub target: Type,
+    pub generics: Vec<GenericParam>,
     pub vis: Visibility,
     pub docs: Vec<String>,
 }
@@ -133,6 +134,44 @@ pub enum CallableTraitQualifier {
     Impl,
 }
 
+/// A closure parameter with its pattern and optional type kept separately.
+///
+/// Keeping the type structured lets optimization passes inspect and rewrite
+/// closure annotations without reparsing a printed `pattern: Type` string.
+#[derive(Debug, Clone)]
+pub struct ClosureParam {
+    pub pattern: String,
+    pub ty: Option<Type>,
+}
+
+impl ClosureParam {
+    pub fn untyped(pattern: impl Into<String>) -> Self {
+        Self {
+            pattern: pattern.into(),
+            ty: None,
+        }
+    }
+
+    pub fn typed(pattern: impl Into<String>, ty: Type) -> Self {
+        Self {
+            pattern: pattern.into(),
+            ty: Some(ty),
+        }
+    }
+}
+
+impl From<&str> for ClosureParam {
+    fn from(pattern: &str) -> Self {
+        Self::untyped(pattern)
+    }
+}
+
+impl From<String> for ClosureParam {
+    fn from(pattern: String) -> Self {
+        Self::untyped(pattern)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum PathType {
     Namespace, // separated by :: (e.g., std::thread)
@@ -155,9 +194,9 @@ pub enum Expr {
     Loop(Box<Block>),
     Await(Box<Expr>),
     /// `(params, body, is_move)` — third field is `true` for `move |…| …` closures.
-    Closure(Vec<String>, Box<Expr>, bool),
+    Closure(Vec<ClosureParam>, Box<Expr>, bool),
     /// A closure whose explicit Rust return type must survive parse/print.
-    TypedClosure(Vec<String>, Type, Box<Expr>, bool),
+    TypedClosure(Vec<ClosureParam>, Type, Box<Expr>, bool),
     BuilderChain(Vec<BuilderMethod>), // represents builder-style chained calls
     Unsafe(Box<Block>),               // unsafe expression support
     If {
