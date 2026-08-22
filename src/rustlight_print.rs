@@ -522,7 +522,7 @@ impl RustCodeGenerator {
                     if i > 0 {
                         self.write(", ");
                     }
-                    self.write(param);
+                    self.generate_closure_param(param);
                 }
                 self.write("| ");
                 match body.as_ref() {
@@ -543,7 +543,7 @@ impl RustCodeGenerator {
                     if i > 0 {
                         self.write(", ");
                     }
-                    self.write(param);
+                    self.generate_closure_param(param);
                 }
                 self.write("| -> ");
                 self.write(&self.type_to_string(return_type));
@@ -718,18 +718,23 @@ impl RustCodeGenerator {
     }
 
     fn generate_call_argument(&mut self, expr: &Expr) {
-        if let Some((cast_expr, ty)) = Self::cast_expr_parts(expr) {
+        // The call delimiters already delimit a complete argument expression,
+        // so an explicit outer `Parenthesized` wrapper is redundant here.
+        // Keep parentheses owned by the expression itself (for example, a
+        // tuple still prints as `(a, b)`) while avoiding shapes such as
+        // `f(({ ... }))` and `f((-x))`.
+        let expr = Self::strip_parenthesized(expr);
+        if let Expr::Cast(cast_expr, ty) = expr {
             self.generate_cast_expr(cast_expr, ty, false);
         } else {
             self.generate_expr(expr);
         }
     }
 
-    fn cast_expr_parts(expr: &Expr) -> Option<(&Expr, &Type)> {
+    fn strip_parenthesized(expr: &Expr) -> &Expr {
         match expr {
-            Expr::Cast(cast_expr, ty) => Some((cast_expr, ty)),
-            Expr::Parenthesized(inner) => Self::cast_expr_parts(inner),
-            _ => None,
+            Expr::Parenthesized(inner) => Self::strip_parenthesized(inner),
+            _ => expr,
         }
     }
 
@@ -761,12 +766,36 @@ impl RustCodeGenerator {
             self.writeln(doc);
         }
         self.writeln(&format!(
-            "{}type {} = {};",
+            "{}type {}{} = {};",
             self.visibility(&t.vis),
             t.name,
+            self.generic_params_to_string(&t.generics),
             self.type_to_string(&t.target)
         ));
         self.writeln("");
+    }
+
+    fn generate_closure_param(&mut self, param: &ClosureParam) {
+        self.write(&param.pattern);
+        if let Some(ty) = &param.ty {
+            self.write(": ");
+            self.write(&self.type_to_string(ty));
+        }
+    }
+
+    fn generic_params_to_string(&self, generics: &[GenericParam]) -> String {
+        if generics.is_empty() {
+            return String::new();
+        }
+
+        format!(
+            "<{}>",
+            generics
+                .iter()
+                .map(|generic| self.generic_param_to_string(generic))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
     }
 
     fn generate_enum(&mut self, e: &EnumDef) {
@@ -1088,8 +1117,8 @@ fn ordered_bounds_to_string(bounds: &[String]) -> String {
 mod tests {
     use super::RustCodeGenerator;
     use crate::rustlight_ast::{
-        Block, CallableTraitQualifier, CallableTraitType, Expr, FunctionDef, Item, Literal, Param,
-        PathType, RustModule, Type, Visibility,
+        Block, CallableTraitQualifier, CallableTraitType, ClosureParam, Expr, FunctionDef,
+        GenericParam, Item, Literal, Param, PathType, RustModule, Type, TypeAlias, Visibility,
     };
 
     fn callable_target() -> Type {
@@ -1178,6 +1207,53 @@ mod tests {
     }
 
     #[test]
+    fn omits_redundant_parentheses_around_block_call_arguments() {
+        let printed = print_function_body(
+            Expr::Call(
+                Box::new(Expr::Ident("f".to_string())),
+                vec![Expr::Parenthesized(Box::new(Expr::Block(Block {
+                    stmts: Vec::new(),
+                    expr: Some(Box::new(Expr::Ident("x".to_string()))),
+                })))],
+            ),
+            Type::Named("Int".to_string()),
+        );
+        assert!(printed.contains("f({"));
+        assert!(!printed.contains("f(({"));
+    }
+
+    #[test]
+    fn omits_redundant_parentheses_around_unary_call_arguments() {
+        let printed = print_function_body(
+            Expr::Call(
+                Box::new(Expr::Ident("f".to_string())),
+                vec![Expr::Parenthesized(Box::new(Expr::UnaryOp(
+                    "-".to_string(),
+                    Box::new(Expr::Ident("i".to_string())),
+                )))],
+            ),
+            Type::Named("Int".to_string()),
+        );
+        assert!(printed.contains("f(-i)"));
+        assert!(!printed.contains("f((-i))"));
+    }
+
+    #[test]
+    fn preserves_tuple_parentheses_in_call_arguments() {
+        let printed = print_function_body(
+            Expr::Call(
+                Box::new(Expr::Ident("f".to_string())),
+                vec![Expr::Parenthesized(Box::new(Expr::Tuple(vec![
+                    Expr::Ident("a".to_string()),
+                    Expr::Ident("b".to_string()),
+                ])))],
+            ),
+            Type::Named("Int".to_string()),
+        );
+        assert!(printed.contains("f((a, b))"));
+    }
+
+    #[test]
     fn parenthesizes_borrowed_binary_expressions() {
         let printed = print_function_body(
             Expr::Reference(
@@ -1198,7 +1274,7 @@ mod tests {
     fn prints_explicit_closure_return_types() {
         let printed = print_function_body(
             Expr::TypedClosure(
-                vec!["x: Int".to_string()],
+                vec![ClosureParam::typed("x", Type::Named("Int".to_string()))],
                 Type::Named("Pred<Unit>".to_string()),
                 Box::new(Expr::Macro("panic!(\"partial\")".to_string())),
                 true,
@@ -1206,6 +1282,30 @@ mod tests {
             callable_target(),
         );
         assert!(printed.contains("move |x: Int| -> Pred<Unit> { panic!(\"partial\") }"));
+    }
+
+    #[test]
+    fn prints_generic_type_alias_parameters_and_bounds() {
+        let module = RustModule {
+            name: "Alias_Test".to_string(),
+            docs: Vec::new(),
+            items: vec![Item::TypeAlias(TypeAlias {
+                name: "Callback".to_string(),
+                target: Type::Generic("Rc".to_string(), vec![Type::Named("T".to_string())]),
+                generics: vec![GenericParam {
+                    name: "T".to_string(),
+                    bounds: vec!["Clone".to_string()],
+                }],
+                vis: Visibility::Public,
+                docs: Vec::new(),
+            })],
+            attrs: Vec::new(),
+            vis: Visibility::Private,
+        };
+        let mut generator = RustCodeGenerator::new();
+        let printed = generator.generate_module_code(&module);
+
+        assert!(printed.contains("pub type Callback<T: Clone> = Rc<T>;"));
     }
 
     #[test]
