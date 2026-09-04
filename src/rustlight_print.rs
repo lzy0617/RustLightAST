@@ -493,6 +493,15 @@ impl RustCodeGenerator {
                 self.dedent();
                 self.write("}");
             }
+            Expr::While {condition, body} => {
+                self.write("while ");
+                self.generate_expr(condition);
+                self.writeln(" {");
+                self.indent();
+                self.generate_block(body);
+                self.dedent();
+                self.write("}");
+            }
             Expr::Await(expr) => {
                 self.generate_expr(expr);
                 self.write(".await");
@@ -1396,5 +1405,25 @@ mod tests {
 
         assert!(printed.contains("} else if inner {"));
         assert!(!printed.contains("} else {\n        if inner"));
+    }
+
+    #[test]
+    fn prints_while_loop() {
+        let printed = print_function_body(
+            Expr::While {
+                condition: Box::new(Expr::BinaryOp(
+                    Box::new(Expr::Ident("i".to_string())),
+                    "<".to_string(),
+                    Box::new(Expr::Literal(Literal::Int(10))),
+                )),
+                body: Block {
+                    stmts: vec![Statement::Break],
+                    expr: None,
+                },
+            },
+            Type::Unit,
+        );
+
+        assert!(printed.contains("while i < 10 {\n        break;\n    }"));
     }
 }
