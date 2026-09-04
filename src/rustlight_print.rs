@@ -502,6 +502,17 @@ impl RustCodeGenerator {
                 self.dedent();
                 self.write("}");
             }
+            Expr::For {pattern, iter, body} => {
+                self.write("for ");
+                self.write(pattern);
+                self.write(" in ");
+                self.generate_expr(iter);
+                self.writeln(" {");
+                self.indent();
+                self.generate_block(body);
+                self.dedent();
+                self.write("}");
+            }
             Expr::Await(expr) => {
                 self.generate_expr(expr);
                 self.write(".await");
@@ -1425,5 +1436,26 @@ mod tests {
         );
 
         assert!(printed.contains("while i < 10 {\n        break;\n    }"));
+    }
+
+    #[test]
+    fn prints_for_loop() {
+        let printed = print_function_body(
+            Expr::For {
+                pattern: "i".to_string(),
+                iter: Box::new(Expr::Array(vec![
+                    Expr::Literal(Literal::Int(1)),
+                    Expr::Literal(Literal::Int(2)),
+                    Expr::Literal(Literal::Int(3)),
+                ])),
+                body: Block {
+                    stmts: vec![Statement::Continue],
+                    expr: None,
+                },
+            },
+            Type::Unit,
+        );
+
+        assert!(printed.contains("for i in [1, 2, 3] {\n        continue;\n    }"));
     }
 }
