@@ -393,6 +393,14 @@ impl RustCodeGenerator {
                 self.writeln(";");
             }
             Statement::Item(item) => self.generate_item(item),
+            Statement::Return(value) => {
+                self.write("return");
+                if let Some(expr) = value {
+                    self.write(" ");
+                    self.generate_expr(expr);
+                }
+                self.writeln(";");
+            }
             Statement::Continue => {
                 self.writeln("continue;");
             }
@@ -1118,7 +1126,8 @@ mod tests {
     use super::RustCodeGenerator;
     use crate::rustlight_ast::{
         Block, CallableTraitQualifier, CallableTraitType, ClosureParam, Expr, FunctionDef,
-        GenericParam, Item, Literal, Param, PathType, RustModule, Type, TypeAlias, Visibility,
+        GenericParam, Item, Literal, Param, PathType, RustModule, Statement, Type, TypeAlias,
+        Visibility,
     };
 
     fn callable_target() -> Type {
@@ -1306,6 +1315,60 @@ mod tests {
         let printed = generator.generate_module_code(&module);
 
         assert!(printed.contains("pub type Callback<T: Clone> = Rc<T>;"));
+    }
+
+    #[test]
+    fn prints_bare_return_statement() {
+        let module = RustModule {
+            name: "Return_Test".to_string(),
+            docs: Vec::new(),
+            items: vec![Item::Function(FunctionDef {
+                name: "early_exit".to_string(),
+                params: Vec::new(),
+                return_type: Type::Unit,
+                generics: Vec::new(),
+                body: Block {
+                    stmts: vec![Statement::Return(None)],
+                    expr: None,
+                },
+                asyncness: false,
+                vis: Visibility::Public,
+                docs: Vec::new(),
+                attrs: Vec::new(),
+            })],
+            attrs: Vec::new(),
+            vis: Visibility::Private,
+        };
+
+        let printed = RustCodeGenerator::new().generate_module_code(&module);
+        assert!(printed.contains("return;"));
+    }
+
+    #[test]
+    fn prints_return_statement_with_value() {
+        let module = RustModule {
+            name: "Return_Test".to_string(),
+            docs: Vec::new(),
+            items: vec![Item::Function(FunctionDef {
+                name: "return_value".to_string(),
+                params: Vec::new(),
+                return_type: Type::Named("Int".to_string()),
+                generics: Vec::new(),
+                body: Block {
+                    stmts: vec![Statement::Return(Some(Expr::Ident("value".to_string())))],
+                    expr: None,
+                },
+                asyncness: false,
+                vis: Visibility::Public,
+                docs: Vec::new(),
+                attrs: Vec::new(),
+            })],
+            attrs: Vec::new(),
+            vis: Visibility::Private,
+        };
+
+        let printed = RustCodeGenerator::new().generate_module_code(&module);
+        assert!(printed.contains("return value;"));
     }
 
     #[test]

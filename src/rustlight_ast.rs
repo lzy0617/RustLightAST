@@ -268,6 +268,7 @@ pub enum Statement {
     Let(LetStmt),
     Expr(Expr),
     Item(Box<Item>),
+    Return(Option<Expr>), // return; / return expr;
     Continue,        // continue statement
     Break,           // break statement
     Comment(String), // comment statement
