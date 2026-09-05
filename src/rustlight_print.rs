@@ -36,9 +36,9 @@ fn binary_precedence(op: &str) -> Precedence {
         "<<" | ">>" => Precedence::Shift,
 
         "+" | "-" => Precedence::Add,
-        
+
         "*" | "/" | "%" => Precedence::Multiply,
-        
+
         _ => Precedence::Unknown,
     }
 }
@@ -48,25 +48,24 @@ fn expr_precedence(expr: &Expr) -> Precedence {
         Expr::BinaryOp(_, op, _) => binary_precedence(op),
 
         Expr::Assign(_, _) => Precedence::Assign,
-        
+
         Expr::Cast(_, _) => Precedence::Cast,
-        
-        Expr::UnaryOp(_, _) |
-        Expr::Reference(_, _, _) => Precedence::Unary,
 
-        Expr::Call(_, _) |
-        Expr::MethodCall(_, _, _) |
-        Expr::Index(_, _) |
-        Expr::Await(_) |
-        Expr::Path(_, PathType::Member)=> Precedence::Postfix,
+        Expr::UnaryOp(_, _) | Expr::Reference(_, _, _) => Precedence::Unary,
 
-        Expr::Ident(_) |
-        Expr::Literal(_) |
-        Expr::Path(_, PathType::Namespace) |
-        Expr::Array(_) |
-        Expr::Tuple(_) |
-        Expr::Macro(_) |
-        Expr::Parenthesized(_) => Precedence::Atom,
+        Expr::Call(_, _)
+        | Expr::MethodCall(_, _, _)
+        | Expr::Index(_, _)
+        | Expr::Await(_)
+        | Expr::Path(_, PathType::Member) => Precedence::Postfix,
+
+        Expr::Ident(_)
+        | Expr::Literal(_)
+        | Expr::Path(_, PathType::Namespace)
+        | Expr::Array(_)
+        | Expr::Tuple(_)
+        | Expr::Macro(_)
+        | Expr::Parenthesized(_) => Precedence::Atom,
 
         _ => Precedence::Unknown,
     }
@@ -523,7 +522,7 @@ impl RustCodeGenerator {
             self.write(")");
         }
     }
-    
+
     fn needs_parentheses(&self, expr: &Expr, context: ExprContext<'_>) -> bool {
         if matches!(context, ExprContext::Root) {
             return false;
@@ -545,9 +544,7 @@ impl RustCodeGenerator {
                     return child_prec != Precedence::Atom;
                 }
 
-                if parent_prec == Precedence::Compare
-                    && child_prec == Precedence::Compare
-                {
+                if parent_prec == Precedence::Compare && child_prec == Precedence::Compare {
                     return true;
                 }
 
@@ -561,30 +558,20 @@ impl RustCodeGenerator {
                     return child_prec != Precedence::Atom;
                 }
 
-                if parent_prec == Precedence::Compare
-                    && child_prec == Precedence::Compare
-                {
+                if parent_prec == Precedence::Compare && child_prec == Precedence::Compare {
                     return true;
                 }
 
                 child_prec <= parent_prec
             }
 
-            ExprContext::AssignLeft => {
-                child_prec <= Precedence::Assign
-            }
+            ExprContext::AssignLeft => child_prec <= Precedence::Assign,
 
-            ExprContext::AssignRight => {
-                child_prec < Precedence::Assign
-            }
+            ExprContext::AssignRight => child_prec < Precedence::Assign,
 
-            ExprContext::UnaryOperand => {
-                child_prec < Precedence::Unary
-            }
+            ExprContext::UnaryOperand => child_prec < Precedence::Unary,
 
-            ExprContext::CastOperand => {
-                child_prec < Precedence::Cast
-            }
+            ExprContext::CastOperand => child_prec < Precedence::Cast,
 
             ExprContext::Postfix(kind) => {
                 // `a.f()` is always parsed as a method call in Rust.
@@ -681,9 +668,24 @@ impl RustCodeGenerator {
                 self.dedent();
                 self.write("}");
             }
-            Expr::While {condition, body} => {
+            Expr::While { condition, body } => {
                 self.write("while ");
                 self.generate_expr_in(condition, ExprContext::Root);
+                self.writeln(" {");
+                self.indent();
+                self.generate_block(body);
+                self.dedent();
+                self.write("}");
+            }
+            Expr::For {
+                pattern,
+                iter,
+                body,
+            } => {
+                self.write("for ");
+                self.write(pattern);
+                self.write(" in ");
+                self.generate_expr_in(iter, ExprContext::Root);
                 self.writeln(" {");
                 self.indent();
                 self.generate_block(body);
@@ -875,7 +877,7 @@ impl RustCodeGenerator {
                 if *mutable {
                     self.write("mut ");
                 }
-                
+
                 self.generate_expr_in(inner_expr, ExprContext::UnaryOperand);
             }
             Expr::BinaryOp(left, op, right) => {
@@ -1768,16 +1770,13 @@ mod tests {
         let printed = print_function_body(
             Expr::Await(Box::new(Expr::Index(
                 Box::new(Expr::MethodCall(
-                    Box::new(Expr::Call(
-                        Box::new(Expr::Ident("foo".to_string())),
-                        vec![],
-                    )),
+                    Box::new(Expr::Call(Box::new(Expr::Ident("foo".to_string())), vec![])),
                     "bar".to_string(),
                     vec![],
                 )),
                 Box::new(Expr::Ident("i".to_string())),
             ))),
-            Type::Named("Result".to_string())
+            Type::Named("Result".to_string()),
         );
 
         assert!(printed.contains("foo().bar()[i].await"));
@@ -1852,13 +1851,11 @@ mod tests {
     #[test]
     fn preserves_explicit_parentheses() {
         let printed = print_function_body(
-            Expr::Parenthesized(
-                Box::new(Expr::BinaryOp(
-                    Box::new(Expr::Ident("a".to_string())),
-                    "+".to_string(),
-                    Box::new(Expr::Ident("b".to_string())),
-                )),
-            ),
+            Expr::Parenthesized(Box::new(Expr::BinaryOp(
+                Box::new(Expr::Ident("a".to_string())),
+                "+".to_string(),
+                Box::new(Expr::Ident("b".to_string())),
+            ))),
             Type::Named("Int".to_string()),
         );
 
@@ -1868,9 +1865,7 @@ mod tests {
     #[test]
     fn preserves_redundant_parentheses() {
         let printed = print_function_body(
-            Expr::Parenthesized(Box::new(
-                Expr::Ident("a".to_string()),
-            )),
+            Expr::Parenthesized(Box::new(Expr::Ident("a".to_string()))),
             Type::Named("Int".to_string()),
         );
 
@@ -1880,9 +1875,9 @@ mod tests {
     #[test]
     fn preserves_nested_explicit_parentheses() {
         let printed = print_function_body(
-            Expr::Parenthesized(Box::new(Expr::Parenthesized(Box::new(
-                Expr::Ident("a".to_string()),
-            )))),
+            Expr::Parenthesized(Box::new(Expr::Parenthesized(Box::new(Expr::Ident(
+                "a".to_string(),
+            ))))),
             Type::Named("Int".to_string()),
         );
 
@@ -1998,7 +1993,7 @@ mod tests {
             Expr::Call(
                 Box::new(Expr::Path(
                     vec!["a".to_string(), "f".to_string()],
-                    PathType::Member
+                    PathType::Member,
                 )),
                 vec![Expr::Ident("x".to_string())],
             ),
@@ -2025,4 +2020,24 @@ mod tests {
         assert!(printed.contains("a.f.g()"));
     }
 
+    #[test]
+    fn prints_for_loop() {
+        let printed = print_function_body(
+            Expr::For {
+                pattern: "i".to_string(),
+                iter: Box::new(Expr::Array(vec![
+                    Expr::Literal(Literal::Int(1)),
+                    Expr::Literal(Literal::Int(2)),
+                    Expr::Literal(Literal::Int(3)),
+                ])),
+                body: Block {
+                    stmts: vec![Statement::Continue],
+                    expr: None,
+                },
+            },
+            Type::Unit,
+        );
+
+        assert!(printed.contains("for i in [1, 2, 3] {\n        continue;\n    }"));
+    }
 }

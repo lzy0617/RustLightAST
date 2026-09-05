@@ -196,6 +196,11 @@ pub enum Expr {
         condition: Box<Expr>,
         body: Block,
     },
+    For {
+        pattern: String,
+        iter: Box<Expr>,
+        body: Block,
+    },
     Await(Box<Expr>),
     /// `(params, body, is_move)` — third field is `true` for `move |…| …` closures.
     Closure(Vec<ClosureParam>, Box<Expr>, bool),
@@ -273,9 +278,9 @@ pub enum Statement {
     Expr(Expr),
     Item(Box<Item>),
     Return(Option<Expr>), // return; / return expr;
-    Continue,        // continue statement
-    Break,           // break statement
-    Comment(String), // comment statement
+    Continue,             // continue statement
+    Break,                // break statement
+    Comment(String),      // comment statement
 }
 
 /// let binding
