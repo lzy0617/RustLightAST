@@ -3,6 +3,99 @@ use crate::rustlight_ast::*;
 
 const MAX_FUNCTION_SIGNATURE_WIDTH: usize = 80;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Precedence {
+    Unknown,
+    Assign,
+    LogicalOr,
+    LogicalAnd,
+    Compare,
+    BitOr,
+    BitXor,
+    BitAnd,
+    Shift,
+    Add,
+    Multiply,
+    Cast,
+    Unary,
+    Postfix,
+    Atom,
+}
+
+fn binary_precedence(op: &str) -> Precedence {
+    match op {
+        "||" => Precedence::LogicalOr,
+        "&&" => Precedence::LogicalAnd,
+
+        "==" | "!=" | "<" | "<=" | ">" | ">=" => Precedence::Compare,
+
+        "|" => Precedence::BitOr,
+        "^" => Precedence::BitXor,
+        "&" => Precedence::BitAnd,
+
+        "<<" | ">>" => Precedence::Shift,
+
+        "+" | "-" => Precedence::Add,
+        
+        "*" | "/" | "%" => Precedence::Multiply,
+        
+        _ => Precedence::Unknown,
+    }
+}
+
+fn expr_precedence(expr: &Expr) -> Precedence {
+    match expr {
+        Expr::BinaryOp(_, op, _) => binary_precedence(op),
+
+        Expr::Assign(_, _) => Precedence::Assign,
+        
+        Expr::Cast(_, _) => Precedence::Cast,
+        
+        Expr::UnaryOp(_, _) |
+        Expr::Reference(_, _, _) => Precedence::Unary,
+
+        Expr::Call(_, _) |
+        Expr::MethodCall(_, _, _) |
+        Expr::Index(_, _) |
+        Expr::Await(_) |
+        Expr::Path(_, PathType::Member)=> Precedence::Postfix,
+
+        Expr::Ident(_) |
+        Expr::Literal(_) |
+        Expr::Path(_, PathType::Namespace) |
+        Expr::Array(_) |
+        Expr::Tuple(_) |
+        Expr::Macro(_) |
+        Expr::Parenthesized(_) => Precedence::Atom,
+
+        _ => Precedence::Unknown,
+    }
+}
+
+// Context for Expr generation, helping to determine when to
+// add parentheses around expressions in certain contexts.
+enum ExprContext<'a> {
+    Root,
+
+    BinaryLeft(&'a str),
+    BinaryRight(&'a str),
+
+    AssignLeft,
+    AssignRight,
+
+    UnaryOperand,
+    CastOperand,
+    Postfix(PostfixKind),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum PostfixKind {
+    Call,
+    MethodCall,
+    Index,
+    Await,
+}
+
 // Rust code generator
 pub struct RustCodeGenerator {
     buffer: String,
@@ -414,6 +507,101 @@ impl RustCodeGenerator {
     }
 
     fn generate_expr(&mut self, expr: &Expr) {
+        self.generate_expr_in(expr, ExprContext::Root);
+    }
+
+    fn generate_expr_in(&mut self, expr: &Expr, context: ExprContext<'_>) {
+        let parenthesized = self.needs_parentheses(expr, context);
+
+        if parenthesized {
+            self.write("(");
+        }
+
+        self.generate_expr_body(expr);
+
+        if parenthesized {
+            self.write(")");
+        }
+    }
+    
+    fn needs_parentheses(&self, expr: &Expr, context: ExprContext<'_>) -> bool {
+        if matches!(context, ExprContext::Root) {
+            return false;
+        }
+
+        let child_prec = expr_precedence(expr);
+
+        if child_prec == Precedence::Unknown {
+            return true;
+        }
+
+        match context {
+            ExprContext::Root => false,
+
+            ExprContext::BinaryLeft(parent_op) => {
+                let parent_prec = binary_precedence(parent_op);
+
+                if parent_prec == Precedence::Unknown {
+                    return child_prec != Precedence::Atom;
+                }
+
+                if parent_prec == Precedence::Compare
+                    && child_prec == Precedence::Compare
+                {
+                    return true;
+                }
+
+                child_prec < parent_prec
+            }
+
+            ExprContext::BinaryRight(parent_op) => {
+                let parent_prec = binary_precedence(parent_op);
+
+                if parent_prec == Precedence::Unknown {
+                    return child_prec != Precedence::Atom;
+                }
+
+                if parent_prec == Precedence::Compare
+                    && child_prec == Precedence::Compare
+                {
+                    return true;
+                }
+
+                child_prec <= parent_prec
+            }
+
+            ExprContext::AssignLeft => {
+                child_prec <= Precedence::Assign
+            }
+
+            ExprContext::AssignRight => {
+                child_prec < Precedence::Assign
+            }
+
+            ExprContext::UnaryOperand => {
+                child_prec < Precedence::Unary
+            }
+
+            ExprContext::CastOperand => {
+                child_prec < Precedence::Cast
+            }
+
+            ExprContext::Postfix(kind) => {
+                // `a.f()` is always parsed as a method call in Rust.
+                // If the AST says "call the value stored in field `f`",
+                // the field expression must be grouped as `(a.f)()`.
+                if matches!(kind, PostfixKind::Call)
+                    && matches!(expr, Expr::Path(path, PathType::Member) if path.len() > 1)
+                {
+                    return true;
+                }
+
+                child_prec < Precedence::Postfix
+            }
+        }
+    }
+
+    fn generate_expr_body(&mut self, expr: &Expr) {
         match expr {
             Expr::Ident(id) => self.write(id),
             Expr::Macro(source) => self.write(source),
@@ -437,7 +625,7 @@ impl RustCodeGenerator {
                     if i > 0 {
                         self.write(", ");
                     }
-                    self.generate_expr(item);
+                    self.generate_expr_in(item, ExprContext::Root);
                 }
                 self.write("]");
             }
@@ -447,7 +635,7 @@ impl RustCodeGenerator {
                     if i > 0 {
                         self.write(", ");
                     }
-                    self.generate_expr(item);
+                    self.generate_expr_in(item, ExprContext::Root);
                 }
                 if items.len() == 1 {
                     self.write(",");
@@ -455,18 +643,18 @@ impl RustCodeGenerator {
                 self.write(")");
             }
             Expr::Call(callee, args) => {
-                self.generate_expr(callee);
+                self.generate_expr_in(callee, ExprContext::Postfix(PostfixKind::Call));
                 self.write("(");
                 for (i, arg) in args.iter().enumerate() {
                     if i > 0 {
                         self.write(", ");
                     }
-                    self.generate_call_argument(arg);
+                    self.generate_expr_in(arg, ExprContext::Root);
                 }
                 self.write(")");
             }
             Expr::MethodCall(receiver, method, args) => {
-                self.generate_expr(receiver);
+                self.generate_expr_in(receiver, ExprContext::Postfix(PostfixKind::MethodCall));
                 if !method.is_empty() {
                     self.write(&format!(".{}", method));
                 }
@@ -475,7 +663,7 @@ impl RustCodeGenerator {
                     if i > 0 {
                         self.write(", ");
                     }
-                    self.generate_call_argument(arg);
+                    self.generate_expr_in(arg, ExprContext::Root);
                 }
                 self.write(")");
             }
@@ -495,7 +683,7 @@ impl RustCodeGenerator {
             }
             Expr::While {condition, body} => {
                 self.write("while ");
-                self.generate_expr(condition);
+                self.generate_expr_in(condition, ExprContext::Root);
                 self.writeln(" {");
                 self.indent();
                 self.generate_block(body);
@@ -503,7 +691,7 @@ impl RustCodeGenerator {
                 self.write("}");
             }
             Expr::Await(expr) => {
-                self.generate_expr(expr);
+                self.generate_expr_in(expr, ExprContext::Postfix(PostfixKind::Await));
                 self.write(".await");
             }
             // The call chain for creating threads inside a process is currently hard-coded
@@ -524,7 +712,7 @@ impl RustCodeGenerator {
                             if *move_kw {
                                 self.write("move ");
                             }
-                            self.generate_expr(closure);
+                            self.generate_expr_in(closure, ExprContext::Root);
                             self.write(")");
                         }
                     }
@@ -543,10 +731,10 @@ impl RustCodeGenerator {
                 }
                 self.write("| ");
                 match body.as_ref() {
-                    Expr::Block(_) => self.generate_expr(body),
+                    Expr::Block(_) => self.generate_expr_in(body, ExprContext::Root),
                     _ => {
                         self.write("{ ");
-                        self.generate_expr(body);
+                        self.generate_expr_in(body, ExprContext::Root);
                         self.write(" }");
                     }
                 }
@@ -566,24 +754,24 @@ impl RustCodeGenerator {
                 self.write(&self.type_to_string(return_type));
                 self.write(" ");
                 match body.as_ref() {
-                    Expr::Block(_) => self.generate_expr(body),
+                    Expr::Block(_) => self.generate_expr_in(body, ExprContext::Root),
                     _ => {
                         self.write("{ ");
-                        self.generate_expr(body);
+                        self.generate_expr_in(body, ExprContext::Root);
                         self.write(" }");
                     }
                 }
             }
             Expr::Match { expr, arms } => {
                 self.write("match ");
-                self.generate_expr(expr);
+                self.generate_expr_in(expr, ExprContext::Root);
                 self.writeln(" {");
                 self.indent();
                 for arm in arms {
                     self.write(&arm.pattern);
                     if let Some(guard) = &arm.guard {
                         self.write(" if ");
-                        self.generate_expr(guard);
+                        self.generate_expr_in(guard, ExprContext::Root);
                     }
                     self.writeln(" => {");
                     self.indent();
@@ -626,7 +814,7 @@ impl RustCodeGenerator {
                 else_branch,
             } => {
                 self.write("if ");
-                self.generate_expr(condition);
+                self.generate_expr_in(condition, ExprContext::Root);
                 self.write(" ");
                 self.writeln("{");
                 self.indent();
@@ -639,11 +827,12 @@ impl RustCodeGenerator {
                         && matches!(else_branch.expr.as_deref(), Some(Expr::If { .. }))
                     {
                         self.write(" else ");
-                        self.generate_expr(
+                        self.generate_expr_in(
                             else_branch
                                 .expr
                                 .as_deref()
                                 .expect("checked nested if expression"),
+                            ExprContext::Root,
                         );
                     } else {
                         self.write(" else ");
@@ -664,7 +853,7 @@ impl RustCodeGenerator {
                 self.write("if let ");
                 self.write(pattern);
                 self.write(" = ");
-                self.generate_expr(value);
+                self.generate_expr_in(value, ExprContext::Root);
                 self.write(" {\n");
                 self.indent();
                 self.generate_block(then_branch);
@@ -686,84 +875,41 @@ impl RustCodeGenerator {
                 if *mutable {
                     self.write("mut ");
                 }
-                if matches!(
-                    inner_expr.as_ref(),
-                    Expr::BinaryOp(_, _, _) | Expr::Assign(_, _) | Expr::Cast(_, _)
-                ) {
-                    self.write("(");
-                    self.generate_expr(inner_expr);
-                    self.write(")");
-                } else {
-                    self.generate_expr(inner_expr);
-                }
+                
+                self.generate_expr_in(inner_expr, ExprContext::UnaryOperand);
             }
             Expr::BinaryOp(left, op, right) => {
-                self.generate_expr(left);
+                self.generate_expr_in(left, ExprContext::BinaryLeft(op));
                 self.write(" ");
                 self.write(op);
                 self.write(" ");
-                self.generate_expr(right);
+                self.generate_expr_in(right, ExprContext::BinaryRight(op));
             }
             Expr::Assign(left, right) => {
-                self.generate_expr(left);
+                self.generate_expr_in(left, ExprContext::AssignLeft);
                 self.write(" = ");
-                self.generate_expr(right);
+                self.generate_expr_in(right, ExprContext::AssignRight);
             }
             Expr::UnaryOp(op, expr) => {
                 self.write(op);
-                self.generate_expr(expr);
+                self.generate_expr_in(expr, ExprContext::UnaryOperand);
             }
             Expr::Index(array, index) => {
-                self.generate_expr(array);
+                self.generate_expr_in(array, ExprContext::Postfix(PostfixKind::Index));
                 self.write("[");
-                self.generate_expr(index);
+                self.generate_expr_in(index, ExprContext::Root);
                 self.write("]");
             }
             Expr::Parenthesized(expr) => {
-                if matches!(expr.as_ref(), Expr::Cast(_, _)) {
-                    self.generate_expr(expr);
-                } else {
-                    self.write("(");
-                    self.generate_expr(expr);
-                    self.write(")");
-                }
+                self.write("(");
+                self.generate_expr_in(expr, ExprContext::Root);
+                self.write(")");
             }
             Expr::Cast(expr, ty) => {
-                self.generate_cast_expr(expr, ty, true);
+                self.generate_expr_in(expr, ExprContext::CastOperand);
+                self.write(" as ");
+                self.write(&self.type_to_string(ty));
             }
-        }
-    }
-
-    fn generate_call_argument(&mut self, expr: &Expr) {
-        // The call delimiters already delimit a complete argument expression,
-        // so an explicit outer `Parenthesized` wrapper is redundant here.
-        // Keep parentheses owned by the expression itself (for example, a
-        // tuple still prints as `(a, b)`) while avoiding shapes such as
-        // `f(({ ... }))` and `f((-x))`.
-        let expr = Self::strip_parenthesized(expr);
-        if let Expr::Cast(cast_expr, ty) = expr {
-            self.generate_cast_expr(cast_expr, ty, false);
-        } else {
-            self.generate_expr(expr);
-        }
-    }
-
-    fn strip_parenthesized(expr: &Expr) -> &Expr {
-        match expr {
-            Expr::Parenthesized(inner) => Self::strip_parenthesized(inner),
-            _ => expr,
-        }
-    }
-
-    fn generate_cast_expr(&mut self, expr: &Expr, ty: &Type, parenthesized: bool) {
-        if parenthesized {
-            self.write("(");
-        }
-        self.generate_expr(expr);
-        self.write(" as ");
-        self.write(&self.type_to_string(ty));
-        if parenthesized {
-            self.write(")");
         }
     }
 
@@ -1186,89 +1332,7 @@ mod tests {
             Expr::Cast(Box::new(Expr::Ident("f".to_string())), target.clone()),
             target,
         );
-        assert!(printed.contains("(f as Rc<dyn Fn(Int) -> Int>)"));
-    }
-
-    #[test]
-    fn avoids_duplicate_parentheses_around_cast() {
-        let target = callable_target();
-        let printed = print_function_body(
-            Expr::Parenthesized(Box::new(Expr::Cast(
-                Box::new(Expr::Ident("f".to_string())),
-                target.clone(),
-            ))),
-            target,
-        );
-        assert!(printed.contains("(f as Rc<dyn Fn(Int) -> Int>)"));
-        assert!(!printed.contains("((f as Rc<dyn Fn(Int) -> Int>))"));
-    }
-
-    #[test]
-    fn omits_outer_cast_parentheses_in_call_arguments() {
-        let target = callable_target();
-        let cast = Expr::Parenthesized(Box::new(Expr::Cast(
-            Box::new(Expr::Ident("f".to_string())),
-            target.clone(),
-        )));
-        let printed = print_function_body(
-            Expr::Call(
-                Box::new(Expr::Path(
-                    vec!["Reg".to_string(), "Reg".to_string()],
-                    PathType::Namespace,
-                )),
-                vec![cast],
-            ),
-            target,
-        );
-        assert!(printed.contains("Reg::Reg(f as Rc<dyn Fn(Int) -> Int>)"));
-        assert!(!printed.contains("Reg::Reg((f as Rc<dyn Fn(Int) -> Int>))"));
-    }
-
-    #[test]
-    fn omits_redundant_parentheses_around_block_call_arguments() {
-        let printed = print_function_body(
-            Expr::Call(
-                Box::new(Expr::Ident("f".to_string())),
-                vec![Expr::Parenthesized(Box::new(Expr::Block(Block {
-                    stmts: Vec::new(),
-                    expr: Some(Box::new(Expr::Ident("x".to_string()))),
-                })))],
-            ),
-            Type::Named("Int".to_string()),
-        );
-        assert!(printed.contains("f({"));
-        assert!(!printed.contains("f(({"));
-    }
-
-    #[test]
-    fn omits_redundant_parentheses_around_unary_call_arguments() {
-        let printed = print_function_body(
-            Expr::Call(
-                Box::new(Expr::Ident("f".to_string())),
-                vec![Expr::Parenthesized(Box::new(Expr::UnaryOp(
-                    "-".to_string(),
-                    Box::new(Expr::Ident("i".to_string())),
-                )))],
-            ),
-            Type::Named("Int".to_string()),
-        );
-        assert!(printed.contains("f(-i)"));
-        assert!(!printed.contains("f((-i))"));
-    }
-
-    #[test]
-    fn preserves_tuple_parentheses_in_call_arguments() {
-        let printed = print_function_body(
-            Expr::Call(
-                Box::new(Expr::Ident("f".to_string())),
-                vec![Expr::Parenthesized(Box::new(Expr::Tuple(vec![
-                    Expr::Ident("a".to_string()),
-                    Expr::Ident("b".to_string()),
-                ])))],
-            ),
-            Type::Named("Int".to_string()),
-        );
-        assert!(printed.contains("f((a, b))"));
+        assert!(printed.contains("f as Rc<dyn Fn(Int) -> Int>"));
     }
 
     #[test]
@@ -1426,4 +1490,539 @@ mod tests {
 
         assert!(printed.contains("while i < 10 {\n        break;\n    }"));
     }
+
+    #[test]
+    fn parenthesizes_addition_inside_multiplication() {
+        let printed = print_function_body(
+            Expr::BinaryOp(
+                Box::new(Expr::BinaryOp(
+                    Box::new(Expr::Ident("a".to_string())),
+                    "+".to_string(),
+                    Box::new(Expr::Ident("b".to_string())),
+                )),
+                "*".to_string(),
+                Box::new(Expr::Ident("c".to_string())),
+            ),
+            Type::Named("Int".to_string()),
+        );
+
+        assert!(printed.contains("(a + b) * c"));
+    }
+
+    #[test]
+    fn omits_parentheses_for_multiplication_inside_addition() {
+        let printed = print_function_body(
+            Expr::BinaryOp(
+                Box::new(Expr::Ident("a".to_string())),
+                "+".to_string(),
+                Box::new(Expr::BinaryOp(
+                    Box::new(Expr::Ident("b".to_string())),
+                    "*".to_string(),
+                    Box::new(Expr::Ident("c".to_string())),
+                )),
+            ),
+            Type::Named("Int".to_string()),
+        );
+
+        assert!(printed.contains("a + b * c"));
+    }
+
+    #[test]
+    fn parenthesizes_right_nested_subtraction() {
+        let printed = print_function_body(
+            Expr::BinaryOp(
+                Box::new(Expr::Ident("a".to_string())),
+                "-".to_string(),
+                Box::new(Expr::BinaryOp(
+                    Box::new(Expr::Ident("b".to_string())),
+                    "-".to_string(),
+                    Box::new(Expr::Ident("c".to_string())),
+                )),
+            ),
+            Type::Named("Int".to_string()),
+        );
+
+        assert!(printed.contains("a - (b - c)"));
+    }
+
+    #[test]
+    fn omits_parentheses_for_left_nested_subtraction() {
+        let printed = print_function_body(
+            Expr::BinaryOp(
+                Box::new(Expr::BinaryOp(
+                    Box::new(Expr::Ident("a".to_string())),
+                    "-".to_string(),
+                    Box::new(Expr::Ident("b".to_string())),
+                )),
+                "-".to_string(),
+                Box::new(Expr::Ident("c".to_string())),
+            ),
+            Type::Named("Int".to_string()),
+        );
+
+        assert!(printed.contains("a - b - c"));
+    }
+
+    #[test]
+    fn parenthesizes_addition_in_unary_operand() {
+        let printed = print_function_body(
+            Expr::UnaryOp(
+                "-".to_string(),
+                Box::new(Expr::BinaryOp(
+                    Box::new(Expr::Ident("a".to_string())),
+                    "+".to_string(),
+                    Box::new(Expr::Ident("b".to_string())),
+                )),
+            ),
+            Type::Named("Int".to_string()),
+        );
+
+        assert!(printed.contains("-(a + b)"));
+    }
+
+    #[test]
+    fn omits_parentheses_around_unary_expression_in_multiplication() {
+        let printed = print_function_body(
+            Expr::BinaryOp(
+                Box::new(Expr::UnaryOp(
+                    "-".to_string(),
+                    Box::new(Expr::Ident("a".to_string())),
+                )),
+                "*".to_string(),
+                Box::new(Expr::Ident("b".to_string())),
+            ),
+            Type::Named("Int".to_string()),
+        );
+
+        assert!(printed.contains("-a * b"));
+    }
+
+    #[test]
+    fn parenthesizes_addition_in_reference_operand() {
+        let printed = print_function_body(
+            Expr::Reference(
+                Box::new(Expr::BinaryOp(
+                    Box::new(Expr::Ident("a".to_string())),
+                    "+".to_string(),
+                    Box::new(Expr::Ident("b".to_string())),
+                )),
+                true,
+                false,
+            ),
+            Type::Named("Int".to_string()),
+        );
+
+        assert!(printed.contains("&(a + b)"));
+    }
+
+    #[test]
+    fn omits_parentheses_for_method_call_in_reference_operand() {
+        let printed = print_function_body(
+            Expr::Reference(
+                Box::new(Expr::MethodCall(
+                    Box::new(Expr::Ident("foo".to_string())),
+                    "bar".to_string(),
+                    vec![],
+                )),
+                true,
+                false,
+            ),
+            Type::Named("Int".to_string()),
+        );
+
+        assert!(printed.contains("&foo.bar()"));
+    }
+
+    #[test]
+    fn parenthesizes_addition_in_cast_operand() {
+        let printed = print_function_body(
+            Expr::Cast(
+                Box::new(Expr::BinaryOp(
+                    Box::new(Expr::Ident("a".to_string())),
+                    "+".to_string(),
+                    Box::new(Expr::Ident("b".to_string())),
+                )),
+                Type::Named("i64".to_string()),
+            ),
+            Type::Named("i64".to_string()),
+        );
+
+        assert!(printed.contains("(a + b) as i64"));
+    }
+
+    #[test]
+    fn omits_parentheses_for_unary_cast_operand() {
+        let printed = print_function_body(
+            Expr::Cast(
+                Box::new(Expr::UnaryOp(
+                    "-".to_string(),
+                    Box::new(Expr::Ident("a".to_string())),
+                )),
+                Type::Named("i64".to_string()),
+            ),
+            Type::Named("i64".to_string()),
+        );
+
+        assert!(printed.contains("-a as i64"));
+    }
+
+    #[test]
+    fn parenthesizes_cast_used_as_method_receiver() {
+        let printed = print_function_body(
+            Expr::MethodCall(
+                Box::new(Expr::Cast(
+                    Box::new(Expr::Ident("x".to_string())),
+                    Type::Named("T".to_string()),
+                )),
+                "foo".to_string(),
+                vec![],
+            ),
+            Type::Named("Int".to_string()),
+        );
+
+        assert!(printed.contains("(x as T).foo()"));
+    }
+
+    #[test]
+    fn omits_unnecessary_parentheses_around_root_cast() {
+        let printed = print_function_body(
+            Expr::Cast(
+                Box::new(Expr::Ident("x".to_string())),
+                Type::Named("T".to_string()),
+            ),
+            Type::Named("T".to_string()),
+        );
+
+        assert!(printed.contains("x as T"));
+        assert!(!printed.contains("(x as T)"));
+    }
+
+    #[test]
+    fn parenthesizes_binary_expression_used_as_call_callee() {
+        let printed = print_function_body(
+            Expr::Call(
+                Box::new(Expr::BinaryOp(
+                    Box::new(Expr::Ident("f".to_string())),
+                    "+".to_string(),
+                    Box::new(Expr::Ident("g".to_string())),
+                )),
+                vec![],
+            ),
+            Type::Named("Int".to_string()),
+        );
+
+        assert!(printed.contains("(f + g)()"));
+    }
+
+    #[test]
+    fn parenthesizes_binary_expression_used_as_method_receiver() {
+        let printed = print_function_body(
+            Expr::MethodCall(
+                Box::new(Expr::BinaryOp(
+                    Box::new(Expr::Ident("f".to_string())),
+                    "+".to_string(),
+                    Box::new(Expr::Ident("g".to_string())),
+                )),
+                "call".to_string(),
+                vec![],
+            ),
+            Type::Named("Int".to_string()),
+        );
+
+        assert!(printed.contains("(f + g).call()"));
+    }
+
+    #[test]
+    fn parenthesizes_binary_expression_used_as_index_receiver() {
+        let printed = print_function_body(
+            Expr::Index(
+                Box::new(Expr::BinaryOp(
+                    Box::new(Expr::Ident("arr".to_string())),
+                    "+".to_string(),
+                    Box::new(Expr::Ident("offset".to_string())),
+                )),
+                Box::new(Expr::Ident("index".to_string())),
+            ),
+            Type::Named("Int".to_string()),
+        );
+
+        assert!(printed.contains("(arr + offset)[index]"));
+    }
+
+    #[test]
+    fn parenthesizes_logical_expression_used_as_await_receiver() {
+        let printed = print_function_body(
+            Expr::Await(Box::new(Expr::BinaryOp(
+                Box::new(Expr::Ident("future1".to_string())),
+                "||".to_string(),
+                Box::new(Expr::Ident("future2".to_string())),
+            ))),
+            Type::Named("Result".to_string()),
+        );
+
+        assert!(printed.contains("(future1 || future2).await"));
+    }
+
+    #[test]
+    fn omits_parentheses_in_postfix_chain() {
+        let printed = print_function_body(
+            Expr::Await(Box::new(Expr::Index(
+                Box::new(Expr::MethodCall(
+                    Box::new(Expr::Call(
+                        Box::new(Expr::Ident("foo".to_string())),
+                        vec![],
+                    )),
+                    "bar".to_string(),
+                    vec![],
+                )),
+                Box::new(Expr::Ident("i".to_string())),
+            ))),
+            Type::Named("Result".to_string())
+        );
+
+        assert!(printed.contains("foo().bar()[i].await"));
+    }
+
+    #[test]
+    fn parenthesizes_left_nested_assignment() {
+        let printed = print_function_body(
+            Expr::Assign(
+                Box::new(Expr::Assign(
+                    Box::new(Expr::Ident("x".to_string())),
+                    Box::new(Expr::Ident("y".to_string())),
+                )),
+                Box::new(Expr::Ident("z".to_string())),
+            ),
+            Type::Named("Int".to_string()),
+        );
+
+        assert!(printed.contains("(x = y) = z"));
+    }
+
+    #[test]
+    fn omits_parentheses_for_right_nested_assignment() {
+        let printed = print_function_body(
+            Expr::Assign(
+                Box::new(Expr::Ident("x".to_string())),
+                Box::new(Expr::Assign(
+                    Box::new(Expr::Ident("y".to_string())),
+                    Box::new(Expr::Ident("z".to_string())),
+                )),
+            ),
+            Type::Named("Int".to_string()),
+        );
+
+        assert!(printed.contains("x = y = z"));
+    }
+
+    #[test]
+    fn parenthesizes_assignment_inside_addition() {
+        let printed = print_function_body(
+            Expr::BinaryOp(
+                Box::new(Expr::Assign(
+                    Box::new(Expr::Ident("x".to_string())),
+                    Box::new(Expr::Ident("y".to_string())),
+                )),
+                "+".to_string(),
+                Box::new(Expr::Ident("z".to_string())),
+            ),
+            Type::Named("Int".to_string()),
+        );
+
+        assert!(printed.contains("(x = y) + z"));
+    }
+
+    #[test]
+    fn omits_parentheses_for_addition_on_assignment_rhs() {
+        let printed = print_function_body(
+            Expr::Assign(
+                Box::new(Expr::Ident("x".to_string())),
+                Box::new(Expr::BinaryOp(
+                    Box::new(Expr::Ident("y".to_string())),
+                    "+".to_string(),
+                    Box::new(Expr::Ident("z".to_string())),
+                )),
+            ),
+            Type::Named("Int".to_string()),
+        );
+
+        assert!(printed.contains("x = y + z"));
+    }
+
+    #[test]
+    fn preserves_explicit_parentheses() {
+        let printed = print_function_body(
+            Expr::Parenthesized(
+                Box::new(Expr::BinaryOp(
+                    Box::new(Expr::Ident("a".to_string())),
+                    "+".to_string(),
+                    Box::new(Expr::Ident("b".to_string())),
+                )),
+            ),
+            Type::Named("Int".to_string()),
+        );
+
+        assert!(printed.contains("(a + b)"));
+    }
+
+    #[test]
+    fn preserves_redundant_parentheses() {
+        let printed = print_function_body(
+            Expr::Parenthesized(Box::new(
+                Expr::Ident("a".to_string()),
+            )),
+            Type::Named("Int".to_string()),
+        );
+
+        assert!(printed.contains("(a)"));
+    }
+
+    #[test]
+    fn preserves_nested_explicit_parentheses() {
+        let printed = print_function_body(
+            Expr::Parenthesized(Box::new(Expr::Parenthesized(Box::new(
+                Expr::Ident("a".to_string()),
+            )))),
+            Type::Named("Int".to_string()),
+        );
+
+        assert!(printed.contains("((a))"));
+    }
+
+    #[test]
+    fn parenthesizes_unknown_binary_operator_when_nested() {
+        let printed = print_function_body(
+            Expr::BinaryOp(
+                Box::new(Expr::BinaryOp(
+                    Box::new(Expr::Ident("a".to_string())),
+                    "???".to_string(),
+                    Box::new(Expr::Ident("b".to_string())),
+                )),
+                "+".to_string(),
+                Box::new(Expr::Ident("c".to_string())),
+            ),
+            Type::Named("Int".to_string()),
+        );
+
+        assert!(printed.contains("(a ??? b) + c"));
+    }
+
+    #[test]
+    fn prints_unknown_binary_operator_at_root_without_parentheses() {
+        let printed = print_function_body(
+            Expr::BinaryOp(
+                Box::new(Expr::Ident("a".to_string())),
+                "???".to_string(),
+                Box::new(Expr::Ident("b".to_string())),
+            ),
+            Type::Named("Int".to_string()),
+        );
+
+        assert!(printed.contains("a ??? b"));
+    }
+
+    #[test]
+    fn parenthesizes_binary_child_of_unknown_operator() {
+        let printed = print_function_body(
+            Expr::BinaryOp(
+                Box::new(Expr::Ident("a".to_string())),
+                "???".to_string(),
+                Box::new(Expr::BinaryOp(
+                    Box::new(Expr::Ident("b".to_string())),
+                    "+".to_string(),
+                    Box::new(Expr::Ident("c".to_string())),
+                )),
+            ),
+            Type::Named("Int".to_string()),
+        );
+
+        assert!(printed.contains("a ??? (b + c)"));
+    }
+
+    #[test]
+    fn preserves_explicit_parentheses_in_call_arguments() {
+        let printed = print_function_body(
+            Expr::Call(
+                Box::new(Expr::Ident("foo".to_string())),
+                vec![Expr::Parenthesized(Box::new(Expr::BinaryOp(
+                    Box::new(Expr::Ident("a".to_string())),
+                    "+".to_string(),
+                    Box::new(Expr::Ident("b".to_string())),
+                )))],
+            ),
+            Type::Named("Int".to_string()),
+        );
+
+        assert!(printed.contains("foo((a + b))"));
+    }
+
+    #[test]
+    fn parenthesizes_left_nested_comparison() {
+        let printed = print_function_body(
+            Expr::BinaryOp(
+                Box::new(Expr::BinaryOp(
+                    Box::new(Expr::Ident("a".to_string())),
+                    "<".to_string(),
+                    Box::new(Expr::Ident("b".to_string())),
+                )),
+                "<".to_string(),
+                Box::new(Expr::Ident("c".to_string())),
+            ),
+            Type::Named("bool".to_string()),
+        );
+
+        assert!(printed.contains("(a < b) < c"));
+    }
+
+    #[test]
+    fn parenthesizes_right_nested_comparison() {
+        let printed = print_function_body(
+            Expr::BinaryOp(
+                Box::new(Expr::Ident("a".to_string())),
+                "<".to_string(),
+                Box::new(Expr::BinaryOp(
+                    Box::new(Expr::Ident("b".to_string())),
+                    "<".to_string(),
+                    Box::new(Expr::Ident("c".to_string())),
+                )),
+            ),
+            Type::Named("bool".to_string()),
+        );
+
+        assert!(printed.contains("a < (b < c)"));
+    }
+
+    #[test]
+    fn parenthesizes_member_path_used_as_call_callee() {
+        let printed = print_function_body(
+            Expr::Call(
+                Box::new(Expr::Path(
+                    vec!["a".to_string(), "f".to_string()],
+                    PathType::Member
+                )),
+                vec![Expr::Ident("x".to_string())],
+            ),
+            Type::Unit,
+        );
+
+        assert!(printed.contains("(a.f)(x)"));
+    }
+
+    #[test]
+    fn omits_parentheses_for_member_path_used_as_method_receiver() {
+        let printed = print_function_body(
+            Expr::MethodCall(
+                Box::new(Expr::Path(
+                    vec!["a".to_string(), "f".to_string()],
+                    PathType::Member,
+                )),
+                "g".to_string(),
+                vec![],
+            ),
+            Type::Named("Int".to_string()),
+        );
+
+        assert!(printed.contains("a.f.g()"));
+    }
+
 }
